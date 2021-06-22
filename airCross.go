@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"sme/utils"
 	"strings"
 
 	"crypto/rand"
@@ -94,7 +93,7 @@ const (
 	iosAgent     = `VMwareBoxer/5199 CFNetwork/1121.2.2 Darwin/19.3.0`
 	androidAgent = `Agent/20.08.0.23/Android/11`
 
-	version = "2.0"
+	version = "2.1"
 	tool    = "airCross"
 	usage   = `
 Usage:
@@ -359,7 +358,7 @@ func (a *attack) auth() {
 	var err error
 
 	if a.file != "" {
-		file, err = utils.ReadFile(a.file)
+		file, err = ReadFile(a.file)
 		if err != nil {
 			a.log.Fatalf([]interface{}{a.file}, "File Read Failure")
 		}
@@ -645,6 +644,21 @@ func (l *logger) Debugf(pre []interface{}, data string, v ...interface{}) {
 
 func (l *logger) StdOut(data string, v ...interface{}) {
 	l.stdout.Printf("["+data+"\n", v...)
+}
+
+// ReadFile opens file for read access and returns a byte slice
+// or error
+func ReadFile(file string) ([]byte, error) {
+	var out []byte
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	out, _ = ioutil.ReadAll(f)
+	f.Close()
+	return out, nil
 }
 
 func main() {
