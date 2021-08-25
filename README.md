@@ -21,6 +21,8 @@ Global Options:
   -gid                   AirWatch GroupID Value
   -sgid                  AirWatch sub-GroupID Value
   -sint                  AirWatch sub-GroupID INT value (Associated to multiple groups)
+  -proxy                 SOCKS5 proxy IP and port for traffic tunneling (aka 127.0.0.1:8081)
+  -sleep                 Sleep time between requests (in seconds) [default: 0s]  
 
   <endpoint>             AirWatch endpoint FQDN
   <dom>                  Discovery domain

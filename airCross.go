@@ -6,21 +6,25 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"strings"
+	"time"
 
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+
+	"golang.org/x/net/proxy"
+
 	URL "net/url"
 )
 
 type attack struct {
 	agent       string
-	debug       bool
-	ddebug      bool
+	debug       int
 	email       string
 	endpoint    string
 	groupID     string
@@ -36,7 +40,9 @@ type attack struct {
 	rudid       bool
 	udid        string
 	user        string
+	proxy       string
 	log         *logger
+	sleep       string
 }
 
 type url struct {
@@ -93,7 +99,7 @@ const (
 	iosAgent     = `VMwareBoxer/5199 CFNetwork/1121.2.2 Darwin/19.3.0`
 	androidAgent = `Agent/20.08.0.23/Android/11`
 
-	version = "2.1"
+	version = "2.2"
 	tool    = "airCross"
 	usage   = `
 Usage:
@@ -115,6 +121,8 @@ Global Options:
   -gid                   AirWatch GroupID Value
   -sgid                  AirWatch sub-GroupID Value
   -sint                  AirWatch sub-GroupID INT value (Associated to multiple groups)
+  -proxy                 SOCKS5 proxy IP and port for traffic tunneling (aka 127.0.0.1:8081)
+  -sleep                 Sleep time between requests (in seconds) [default: 0s]  
 
   <endpoint>             AirWatch endpoint FQDN
   <dom>                  Discovery domain
@@ -169,6 +177,10 @@ func (a *attack) webCall(u *url) []byte {
 		InsecureSkipVerify: true,
 	}
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	if a.proxy != "" {
+		socks, _ := proxy.SOCKS5("tcp", a.proxy, nil, &net.Dialer{Timeout: 5 * time.Second})
+		transport.Dial = socks.Dial
+	}
 
 	client := &http.Client{
 		Transport: transport,
@@ -194,9 +206,9 @@ func (a *attack) webCall(u *url) []byte {
 		}
 	}
 
-	if a.debug {
+	if a.debug > 0 {
 		a.log.Debugf([]interface{}{u.name}, "REQUEST HEADER: %s %s %s", req.URL, req.Proto, req.Header)
-		if a.ddebug {
+		if a.debug > 1 {
 			a.log.Debugf([]interface{}{u.name}, "REQUEST BODY: %s", req.Body)
 		}
 	}
@@ -219,7 +231,7 @@ func (a *attack) webCall(u *url) []byte {
 		return nil
 	}
 
-	if a.ddebug {
+	if a.debug > 1 {
 		a.log.Debugf(nil, "RESPONSE BODY: %s", bodyBytes)
 	}
 
@@ -368,8 +380,13 @@ func (a *attack) auth() {
 	thread := make(chan bool, len(lines))
 	buff := make(chan bool, a.threads)
 
+	wait, err := time.ParseDuration(a.sleep)
+	if err != nil {
+		a.log.Fatalf([]interface{}{}, "Sleep Timer Error: %v", err)
+	}
+
 	if a.method != "auth-gid" {
-		a.log.Infof(nil, "threading %d values across %d threads", len(lines), a.threads)
+		a.log.Infof(nil, "threading %d values across %d threads and sleep of %s", len(lines), a.threads, a.sleep)
 	}
 	for _, line := range lines {
 		if len(lines) > 1 && line == "" {
@@ -467,6 +484,7 @@ func (a *attack) auth() {
 		}
 
 		target.thread(&buff, &thread, &req)
+		time.Sleep(wait)
 	}
 
 	close(buff)
@@ -661,6 +679,16 @@ func ReadFile(file string) ([]byte, error) {
 	return out, nil
 }
 
+func debugLevel(verb ...*bool) int {
+	level := 0
+	for i, x := range verb {
+		if *x {
+			level += i + 1
+		}
+	}
+	return level
+}
+
 func main() {
 	// Global program variable definitions
 	var (
@@ -668,8 +696,6 @@ func main() {
 			sid: `00000000-0000-0000-0000-000000000000`,
 		}
 		flAgent   = flag.String("a", "Agent/20.08.0.23/Android/11", "")
-		flDebug   = flag.Bool("d", false, "")
-		flDDebug  = flag.Bool("dd", false, "")
 		flEmail   = flag.String("email", "", "")
 		flGID     = flag.String("gid", "", "")
 		flSubGInt = flag.Int("sint", 0, "")
@@ -680,6 +706,10 @@ func main() {
 		flUDID    = flag.String("udid", "", "")
 		flUser    = flag.String("u", "", "")
 		flVersion = flag.Bool("v", false, "")
+		flProxy   = flag.String("proxy", "", "")
+		flD1      = flag.Bool("d", false, "")
+		flD2      = flag.Bool("dd", false, "")
+		flSleep   = flag.String("sleep", "0s", "")
 	)
 
 	// Flag parsing
@@ -720,17 +750,12 @@ func main() {
 	attack.rudid = *flRUDID
 	attack.udid = *flUDID
 	attack.user = *flUser
+	attack.proxy = *flProxy
+	attack.debug = debugLevel(flD1, flD2)
+	attack.sleep = *flSleep
 	attack.log = &logger{
 		stdout: log.New(os.Stdout, "", 0),
 		stderr: log.New(os.Stderr, "", 0),
-	}
-
-	// Increase Debug verbosity
-	if *flDDebug {
-		attack.debug = true
-		attack.ddebug = true
-	} else {
-		attack.debug = *flDebug
 	}
 
 	if attack.method == "" {
